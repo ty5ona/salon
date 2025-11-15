@@ -1,0 +1,58 @@
+#!/bin/bash
+
+echo "=== Booking ID Enumeration Analysis ==="
+echo ""
+echo "1. Booking IDs are WordPress Post IDs (sequential integers)"
+echo "   - Post type: 'sln_booking'"
+echo "   - IDs start at 1 and increment: 1, 2, 3, 4, ..."
+echo ""
+echo "2. createBooking() does NOT check ownership:"
+cat << 'CODE'
+   public function createBooking($booking) {
+       if (is_int($booking)) {
+           $booking = get_post($booking);  // ⚠️ Just fetches post, no auth
+       }
+       return new SLN_Wrapper_Booking($booking);
+   }
+CODE
+echo ""
+echo "3. Are booking IDs easy to enumerate?"
+echo "   YES - They're sequential WordPress post IDs"
+echo ""
+echo "4. Can user A access user B's booking?"
+echo "   Let's check if WordPress post permissions apply..."
+echo ""
+echo "WordPress get_post() behavior:"
+echo "   - Returns post regardless of author"
+echo "   - Does NOT check current_user_can()"
+echo "   - Only checks if post exists and matches post_type"
+echo ""
+echo "=== IDOR Attack Scenario ==="
+echo ""
+echo "Attacker (User ID 5, logged in) attempts to cancel User ID 3's booking:"
+echo ""
+echo "POST /wp-admin/admin-ajax.php"
+echo "action=salon&method=SetBookingStatus&booking_id=123&status=sln-b-canceled"
+echo ""
+echo "What happens:"
+echo "1. is_user_logged_in() = true ✓ (attacker is logged in)"
+echo "2. createBooking(123) = fetches booking #123 (owned by User 3)"
+echo "3. setStatus('sln-b-canceled') = changes status ⚠️ NO OWNERSHIP CHECK!"
+echo "4. Success! Attacker canceled victim's booking"
+echo ""
+echo "=== Enumeration Techniques ==="
+echo ""
+echo "Method 1: Sequential guessing"
+echo "  for id in {1..1000}; do"
+echo "    curl -X POST '...ajax.php' --data \"booking_id=\$id&status=sln-b-confirmed\""
+echo "  done"
+echo ""
+echo "Method 2: Observe own booking IDs"
+echo "  - User creates booking, gets ID 123"
+echo "  - IDs 120-130 likely exist"
+echo "  - Target nearby IDs"
+echo ""
+echo "Method 3: Check for information disclosure"
+echo "  - Are booking IDs visible in URLs?"
+echo "  - In confirmation emails?"
+echo "  - In public calendars?"
